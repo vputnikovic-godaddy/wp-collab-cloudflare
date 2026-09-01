@@ -36,6 +36,19 @@ if ( config.wsUrl ) {
 					let destroyed = false;
 					const statusCallbacks = [];
 
+					// Gutenberg tears its sync entity down and rebuilds it several
+					// times while the editor boots, and every rebuild is a fresh
+					// Y.Doc — so a fresh awareness identity for the same person.
+					// Announcing presence the instant we connect made each of those
+					// throwaway identities show up as its own collaborator avatar in
+					// everyone else's window, then vanish a moment later. Waiting
+					// until a connection has proven it will survive means the
+					// short-lived ones never announce at all. Document sync is NOT
+					// delayed — only presence.
+					const PRESENCE_SETTLE_MS = 1500;
+					let presenceReady = false;
+					let presenceTimer;
+
 					function sendMsg( buf ) {
 						if ( ws && ws.readyState === WebSocket.OPEN ) {
 							ws.send( buf );
@@ -106,6 +119,62 @@ if ( config.wsUrl ) {
 						sendMsg( encoding.toUint8Array( enc ) );
 					}
 
+					// Collapse multiple awareness identities that belong to the same
+					// WordPress user down to one.
+					//
+					// Gutenberg keys its collaborator list by awareness clientID and
+					// mints a fresh Y.Doc (so a fresh clientID) every time it rebuilds
+					// its sync entity — which it does several times while the editor
+					// boots, and again on every reload. One person therefore occupies
+					// several slots and shows up as repeated avatars. The awareness
+					// state carries the real user in `collaboratorInfo.id`, so we can
+					// tell those apart from genuinely different people.
+					//
+					// Winner is the newest provider (largest `enteredAt`), with our own
+					// clientID always winning: dropping our own local state would
+					// remove us from everyone else's list.
+					function dedupeCollaborators() {
+						if ( ! awareness ) {
+							return;
+						}
+						const bestByUser = new Map();
+						const drop = [];
+
+						awareness.getStates().forEach( ( state, clientID ) => {
+							const info = state?.collaboratorInfo;
+							if ( ! info || info.id === undefined ) {
+								return;
+							}
+							// Never let our own entry lose.
+							const rank =
+								clientID === awareness.clientID
+									? Infinity
+									: info.enteredAt ?? 0;
+							const best = bestByUser.get( info.id );
+							if ( ! best ) {
+								bestByUser.set( info.id, { clientID, rank } );
+								return;
+							}
+							if ( rank > best.rank ) {
+								drop.push( best.clientID );
+								bestByUser.set( info.id, { clientID, rank } );
+							} else {
+								drop.push( clientID );
+							}
+						} );
+
+						if ( drop.length ) {
+							// Origin 'dedupe' — onAwarenessUpdate must not broadcast
+							// this. It is a local display decision; other peers may
+							// still legitimately see those clients.
+							awarenessProtocol.removeAwarenessStates(
+								awareness,
+								drop,
+								'dedupe'
+							);
+						}
+					}
+
 					// -- Doc & awareness event handlers --
 
 					const onDocUpdate = ( update, origin ) => {
@@ -114,7 +183,36 @@ if ( config.wsUrl ) {
 						}
 					};
 
-					const onAwarenessUpdate = ( { added, updated, removed } ) => {
+					// Announce this client's presence, and allow later changes through.
+					function announcePresence() {
+						presenceReady = true;
+						if ( awareness ) {
+							// Sends whatever the local state is *now*, so nothing that
+							// changed during the settle window is lost.
+							sendAwareness( [ awareness.clientID ] );
+						}
+					}
+
+					const onAwarenessUpdate = (
+						{ added, updated, removed },
+						origin
+					) => {
+						// Don't echo back what a peer just told us — the relay already
+						// fanned that frame out to everyone. Re-sending it only wastes
+						// a round trip (peers drop it on the clock check anyway).
+						if ( origin === 'ws-provider' ) {
+							return;
+						}
+						// Never broadcast a local dedupe: telling other peers to drop a
+						// client we merely chose not to display would evict someone who
+						// is alive and well from their lists too.
+						if ( origin === 'dedupe' ) {
+							return;
+						}
+						// Stay silent until this connection has settled.
+						if ( ! presenceReady ) {
+							return;
+						}
 						const changed = added.concat( updated, removed );
 						sendAwareness( changed );
 					};
@@ -139,10 +237,17 @@ if ( config.wsUrl ) {
 								cb( { status: 'connected' } )
 							);
 							sendSyncStep1();
+							// ...and announce our full state, unsolicited. Any peer
+							// already in the room sent its step1 before we arrived, so
+							// it will never ask us for our state — and Yjs silently
+							// parks updates whose history it is missing (pending
+							// structs). That is what makes edits sync one way only.
+							sendSyncStep2(); // no state vector => whole document
 							if ( awareness ) {
-								sendAwareness( [
-									awareness.clientID,
-								] );
+								presenceTimer = setTimeout(
+									announcePresence,
+									PRESENCE_SETTLE_MS
+								);
 							}
 						} );
 
@@ -164,6 +269,9 @@ if ( config.wsUrl ) {
 											update,
 											'ws-provider'
 										);
+										// Same task as the apply, so the duplicate is
+										// gone before anything can render it.
+										dedupeCollaborators();
 									}
 									break;
 							}
@@ -171,6 +279,9 @@ if ( config.wsUrl ) {
 
 						ws.addEventListener( 'close', () => {
 							connected = false;
+							// A reconnect has to earn its presence again.
+							presenceReady = false;
+							clearTimeout( presenceTimer );
 							statusCallbacks.forEach( ( cb ) =>
 								cb( { status: 'disconnected' } )
 							);
@@ -189,6 +300,7 @@ if ( config.wsUrl ) {
 					return {
 						destroy: () => {
 							destroyed = true;
+							clearTimeout( presenceTimer );
 							ydoc.off( 'update', onDocUpdate );
 							if ( awareness ) {
 								awareness.off( 'update', onAwarenessUpdate );
